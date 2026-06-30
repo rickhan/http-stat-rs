@@ -35,14 +35,9 @@ use std::time::Instant;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // Handle request error and update statistics
-pub(crate) fn finish_with_error(
-    mut stat: HttpStat,
-    error: impl ToString,
-    start: Instant,
-) -> HttpStat {
+pub(crate) fn finish_with_error(stat: &mut HttpStat, error: impl ToString, start: Instant) {
     stat.error = Some(error.to_string());
     stat.total = Some(start.elapsed());
-    stat
 }
 
 /// A single `--connect-to HOST1:PORT1:HOST2:PORT2` entry.

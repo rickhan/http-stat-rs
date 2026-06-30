@@ -89,8 +89,9 @@ pub(crate) async fn grpc_request(http_req: HttpRequest) -> HttpStat {
     let endpoint = match endpoint.user_agent(format!("httpstat.rs/{VERSION}")) {
         Ok(endpoint) => endpoint,
         Err(e) => {
-            let stat = stat.lock().await;
-            return finish_with_error(stat.clone(), e, start);
+            let mut stat = stat.lock().await;
+            finish_with_error(&mut stat, e, start);
+            return stat.clone();
         }
     };
 
@@ -103,8 +104,9 @@ pub(crate) async fn grpc_request(http_req: HttpRequest) -> HttpStat {
     {
         Ok(conn) => conn,
         Err(e) => {
-            let stat = stat.lock().await;
-            return finish_with_error(stat.clone(), e, start);
+            let mut stat = stat.lock().await;
+            finish_with_error(&mut stat, e, start);
+            return stat.clone();
         }
     };
     let mut client = HealthClient::new(conn);
@@ -112,8 +114,9 @@ pub(crate) async fn grpc_request(http_req: HttpRequest) -> HttpStat {
     let resp = match client.check(HealthCheckRequest::default()).await {
         Ok(resp) => resp,
         Err(e) => {
-            let stat = stat.lock().await;
-            return finish_with_error(stat.clone(), e, start);
+            let mut stat = stat.lock().await;
+            finish_with_error(&mut stat, e, start);
+            return stat.clone();
         }
     };
 
@@ -123,7 +126,8 @@ pub(crate) async fn grpc_request(http_req: HttpRequest) -> HttpStat {
         guard.clone()
     };
     if resp.get_ref().status() != ServingStatus::Serving.into() {
-        return finish_with_error(stat, "service not serving", start);
+        finish_with_error(&mut stat, "service not serving", start);
+        return stat.clone();
     }
     let (meta, message, _) = resp.into_parts();
     if let Some(grpc_status) = meta.get("grpc-status") {

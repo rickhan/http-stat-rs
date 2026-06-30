@@ -441,7 +441,8 @@ fn resolve_redirect(base: &Uri, location: &str) -> Option<Uri> {
 }
 
 async fn do_request(mut req: HttpRequest, follow_redirect: bool) -> HttpStat {
-    let mut stat = request(req.clone()).await;
+    let mut stat = HttpStat::default();
+    request(req.clone(), &mut stat).await;
     if follow_redirect {
         for _ in 0..10 {
             let status = stat.status.unwrap_or(StatusCode::OK);
@@ -514,7 +515,9 @@ async fn do_request(mut req: HttpRequest, follow_redirect: bool) -> HttpStat {
             }
 
             req.uri = new_uri;
-            stat = request(req.clone()).await;
+            let mut new_stat = HttpStat::default();
+            request(req.clone(), &mut new_stat).await;
+            stat = new_stat;
         }
     }
     stat
@@ -1106,12 +1109,28 @@ async fn main() {
         }
     } else if count > 1 && args.reuse {
         // Benchmark with connection reuse
-        let (connect_stat, conn) = connect(&req).await;
+        let mut connect_stat = HttpStat::default();
+        let conn = connect(&req, &mut connect_stat).await;
         if let Some(mut conn) = conn {
             let width = count.to_string().len();
             let mut stats = Vec::with_capacity(count);
             for i in 0..count {
-                let mut stat = with_max_time(conn.send(&req), max_time).await;
+                let mut stat = HttpStat::default();
+                match max_time {
+                    Some(d) => match tokio::time::timeout(d, conn.send(&req, &mut stat)).await {
+                        Err(_) => {
+                            stat.total = Some(d);
+                            stat.error = Some(format!(
+                                "timeout: exceeded --max-time of {}",
+                                format_duration(d)
+                            ));
+                        }
+
+                        _ => {}
+                    },
+                    None => conn.send(&req, &mut stat).await,
+                };
+                // with_max_time(conn.send(&req, &mut stat), max_time).await;
                 stat.addr.clone_from(&connect_stat.addr);
                 stat.alpn.clone_from(&connect_stat.alpn);
                 stat.silent = true;

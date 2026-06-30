@@ -276,19 +276,17 @@ async fn send_https2_request(
 }
 
 // Handle HTTP/3 request
-async fn http3_request(http_req: HttpRequest) -> HttpStat {
+async fn http3_request(http_req: HttpRequest, stat: &mut HttpStat) {
     let start = Instant::now();
-    let mut stat = HttpStat {
-        alpn: Some(ALPN_HTTP3.to_string()),
-        ..Default::default()
-    };
+    stat.alpn = Some(ALPN_HTTP3.to_string());
 
     // DNS resolution
-    let dns_result = dns_resolve(&http_req, &mut stat).await;
+    let dns_result = dns_resolve(&http_req, stat).await;
     let (addr, host) = match dns_result {
         Ok(result) => result,
         Err(e) => {
-            return finish_with_error(stat, e, start);
+            finish_with_error(stat, e, start);
+            return;
         }
     };
 
@@ -302,17 +300,19 @@ async fn http3_request(http_req: HttpRequest) -> HttpStat {
             http_req.client_cert.as_deref(),
             http_req.client_key.as_deref(),
             http_req.bind_addr,
-            &mut stat,
+            stat,
         ),
     )
     .await
     {
         Ok(Ok(result)) => result,
         Ok(Err(e)) => {
-            return finish_with_error(stat, e, start);
+            finish_with_error(stat, e, start);
+            return;
         }
         Err(e) => {
-            return finish_with_error(stat, e, start);
+            finish_with_error(stat, e, start);
+            return;
         }
     };
 
@@ -340,7 +340,7 @@ async fn http3_request(http_req: HttpRequest) -> HttpStat {
                     stat.cert_cipher = Some(oid_str);
                 }
             }
-            parse_certificates(&certs, &mut stat);
+            parse_certificates(&certs, stat);
         }
     }
 
@@ -355,10 +355,12 @@ async fn http3_request(http_req: HttpRequest) -> HttpStat {
     {
         Ok(Ok(result)) => result,
         Ok(Err(e)) => {
-            return finish_with_error(stat, e, start);
+            finish_with_error(stat, e, start);
+            return;
         }
         Err(e) => {
-            return finish_with_error(stat, e, start);
+            finish_with_error(stat, e, start);
+            return;
         }
     };
 
@@ -366,7 +368,8 @@ async fn http3_request(http_req: HttpRequest) -> HttpStat {
     let mut req = match http_req.builder(false).body(()) {
         Ok(req) => req,
         Err(e) => {
-            return finish_with_error(stat, e, start);
+            finish_with_error(stat, e, start);
+            return;
         }
     };
     *req.version_mut() = Version::HTTP_3;
@@ -447,8 +450,6 @@ async fn http3_request(http_req: HttpRequest) -> HttpStat {
     stat.total = Some(start.elapsed());
     // Close the connection immediately instead of waiting for idle
     client_endpoint.close(0u32.into(), b"done");
-
-    stat
 }
 
 /// Connect to the effective TCP endpoint (direct or via proxy).
@@ -516,18 +517,18 @@ async fn tcp_via_proxy(
     }
 }
 
-async fn http1_2_request(mut http_req: HttpRequest) -> HttpStat {
+async fn http1_2_request(mut http_req: HttpRequest, stat: &mut HttpStat) {
     let start = Instant::now();
-    let mut stat = HttpStat::default();
+    // let mut stat = HttpStat::default();
 
     let is_https = http_req.uri.scheme() == Some(&http::uri::Scheme::HTTPS);
 
     // Establish TCP (direct or via proxy)
-    let (tcp_stream, host, is_http_forward, tcp_probe) =
-        match tcp_via_proxy(&http_req, &mut stat).await {
-            Ok(r) => r,
-            Err(e) => return finish_with_error(stat, e, start),
-        };
+    let (tcp_stream, host, is_http_forward, tcp_probe) = match tcp_via_proxy(&http_req, stat).await
+    {
+        Ok(r) => r,
+        Err(e) => return finish_with_error(stat, e, start),
+    };
 
     // HTTP forward proxy: request must use the full absolute URI
     if is_http_forward {
@@ -540,11 +541,12 @@ async fn http1_2_request(mut http_req: HttpRequest) -> HttpStat {
     // Send request based on protocol
     let resp = if is_https {
         // TLS handshake
-        let tls_result = tls_handshake(host.clone(), tcp_stream, &http_req, &mut stat).await;
+        let tls_result = tls_handshake(host.clone(), tcp_stream, &http_req, stat).await;
         let (tls_stream, is_http2) = match tls_result {
             Ok(result) => result,
             Err(e) => {
-                return finish_with_error(stat, e, start);
+                finish_with_error(stat, e, start);
+                return;
             }
         };
 
@@ -553,23 +555,18 @@ async fn http1_2_request(mut http_req: HttpRequest) -> HttpStat {
             let (req, done) = match build_tracked_request(&http_req, false) {
                 Ok(r) => r,
                 Err(e) => {
-                    return finish_with_error(stat, e, start);
+                    finish_with_error(stat, e, start);
+                    return;
                 }
             };
             stat.request_headers = req.headers().clone();
-            match send_https2_request(
-                req,
-                done,
-                tls_stream,
-                http_req.request_timeout,
-                tx,
-                &mut stat,
-            )
-            .await
+            match send_https2_request(req, done, tls_stream, http_req.request_timeout, tx, stat)
+                .await
             {
                 Ok(resp) => resp,
                 Err(e) => {
-                    return finish_with_error(stat, e, start);
+                    finish_with_error(stat, e, start);
+                    return;
                 }
             }
         } else {
@@ -580,15 +577,8 @@ async fn http1_2_request(mut http_req: HttpRequest) -> HttpStat {
                 }
             };
             stat.request_headers = req.headers().clone();
-            match send_http1_request(
-                req,
-                done,
-                tls_stream,
-                http_req.request_timeout,
-                tx,
-                &mut stat,
-            )
-            .await
+            match send_http1_request(req, done, tls_stream, http_req.request_timeout, tx, stat)
+                .await
             {
                 Ok(resp) => resp,
                 Err(e) => {
@@ -600,24 +590,17 @@ async fn http1_2_request(mut http_req: HttpRequest) -> HttpStat {
         let (req, done) = match build_tracked_request(&http_req, true) {
             Ok(r) => r,
             Err(e) => {
-                return finish_with_error(stat, e, start);
+                finish_with_error(stat, e, start);
+                return;
             }
         };
         stat.request_headers = req.headers().clone();
         // Send HTTP request
-        match send_http1_request(
-            req,
-            done,
-            tcp_stream,
-            http_req.request_timeout,
-            tx,
-            &mut stat,
-        )
-        .await
-        {
+        match send_http1_request(req, done, tcp_stream, http_req.request_timeout, tx, stat).await {
             Ok(resp) => resp,
             Err(e) => {
-                return finish_with_error(stat, e, start);
+                finish_with_error(stat, e, start);
+                return;
             }
         }
     };
@@ -626,8 +609,8 @@ async fn http1_2_request(mut http_req: HttpRequest) -> HttpStat {
     stat.status = Some(resp.status());
     stat.headers = Some(resp.headers().clone());
     stat.version = Some(format!("{:?}", resp.version()));
-    capture_server_timing(&mut stat, resp.headers());
-    capture_protocol_advertisements(&mut stat, resp.headers());
+    capture_server_timing(stat, resp.headers());
+    capture_protocol_advertisements(stat, resp.headers());
 
     // Check for connection errors
     if let Ok(error) = rx.try_recv() {
@@ -641,7 +624,10 @@ async fn http1_2_request(mut http_req: HttpRequest) -> HttpStat {
     let drain_result = drain_body_with_split(resp.into_body(), content_transfer_start).await;
     let (body_bytes, time_to_first_100k) = match drain_result {
         Ok(p) => p,
-        Err(e) => return finish_with_error(stat, e, start),
+        Err(e) => {
+            finish_with_error(stat, e, start);
+            return;
+        }
     };
     stat.wire_body_size = Some(body_bytes.len());
     stat.time_to_first_100k = time_to_first_100k;
@@ -656,7 +642,6 @@ async fn http1_2_request(mut http_req: HttpRequest) -> HttpStat {
     }
 
     stat.total = Some(start.elapsed());
-    stat
 }
 
 /// Performs an HTTP request and returns detailed statistics about the request lifecycle.
@@ -693,17 +678,17 @@ async fn http1_2_request(mut http_req: HttpRequest) -> HttpStat {
 /// - TLS and certificate information (for HTTPS)
 /// - Any errors that occurred during the request
 /// ```
-pub async fn request(http_req: HttpRequest) -> HttpStat {
+pub async fn request(http_req: HttpRequest, stat: &mut HttpStat) {
     ensure_crypto_provider();
     let is_grpc = matches!(http_req.uri.scheme_str().unwrap_or(""), "grpc" | "grpcs");
 
     // Handle HTTP/3 request
-    let mut stat = if is_grpc {
-        grpc_request(http_req).await
+    if is_grpc {
+        *stat = grpc_request(http_req).await;
     } else if http_req.alpn_protocols.iter().any(|p| p == ALPN_HTTP3) {
-        http3_request(http_req).await
+        http3_request(http_req, stat).await;
     } else {
-        http1_2_request(http_req).await
+        http1_2_request(http_req, stat).await;
     };
     if let Some(body) = &stat.body {
         stat.body_size = Some(body.len());
@@ -729,8 +714,6 @@ pub async fn request(http_req: HttpRequest) -> HttpStat {
             }
         }
     }
-
-    stat
 }
 
 // --- Connection reuse API ---
@@ -757,10 +740,10 @@ pub struct HttpConnection {
 async fn establish_http1<S>(
     stream: S,
     handshake_timeout: Duration,
-    mut stat: HttpStat,
+    stat: &mut HttpStat,
     tcp_probe: Option<crate::tcp_info::TcpInfoProbe>,
     start: Instant,
-) -> (HttpStat, Option<HttpConnection>)
+) -> Option<HttpConnection>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -776,34 +759,32 @@ where
             });
             stat.total = Some(start.elapsed());
             let last_tcp_info = stat.tcp_info_post_connect.clone();
-            (
-                stat,
-                Some(HttpConnection {
-                    sender: ConnectionSender::Http1(sender),
-                    is_http2: false,
-                    tcp_probe,
-                    last_tcp_info,
-                }),
-            )
+
+            Some(HttpConnection {
+                sender: ConnectionSender::Http1(sender),
+                is_http2: false,
+                tcp_probe,
+                last_tcp_info,
+            })
         }
-        Ok(Err(e)) => (
-            finish_with_error(stat, Error::Hyper { source: e }, start),
-            None,
-        ),
-        Err(e) => (
-            finish_with_error(stat, Error::Timeout { source: e }, start),
-            None,
-        ),
+        Ok(Err(e)) => {
+            finish_with_error(stat, Error::Hyper { source: e }, start);
+            None
+        }
+        Err(e) => {
+            finish_with_error(stat, Error::Timeout { source: e }, start);
+            None
+        }
     }
 }
 
 async fn establish_http2<S>(
     stream: S,
     handshake_timeout: Duration,
-    mut stat: HttpStat,
+    stat: &mut HttpStat,
     tcp_probe: Option<crate::tcp_info::TcpInfoProbe>,
     start: Instant,
-) -> (HttpStat, Option<HttpConnection>)
+) -> Option<HttpConnection>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -819,24 +800,22 @@ where
             });
             stat.total = Some(start.elapsed());
             let last_tcp_info = stat.tcp_info_post_connect.clone();
-            (
-                stat,
-                Some(HttpConnection {
-                    sender: ConnectionSender::Http2(sender),
-                    is_http2: true,
-                    tcp_probe,
-                    last_tcp_info,
-                }),
-            )
+
+            Some(HttpConnection {
+                sender: ConnectionSender::Http2(sender),
+                is_http2: true,
+                tcp_probe,
+                last_tcp_info,
+            })
         }
-        Ok(Err(e)) => (
-            finish_with_error(stat, Error::Hyper { source: e }, start),
-            None,
-        ),
-        Err(e) => (
-            finish_with_error(stat, Error::Timeout { source: e }, start),
-            None,
-        ),
+        Ok(Err(e)) => {
+            finish_with_error(stat, Error::Hyper { source: e }, start);
+            None
+        }
+        Err(e) => {
+            finish_with_error(stat, Error::Timeout { source: e }, start);
+            None
+        }
     }
 }
 
@@ -844,25 +823,31 @@ where
 ///
 /// Returns `(connect_stat, Some(conn))` on success, or `(error_stat, None)` on failure.
 /// Only supports HTTP/1.1 and HTTP/2. For HTTP/3 or gRPC, use `request()` directly.
-pub async fn connect(http_req: &HttpRequest) -> (HttpStat, Option<HttpConnection>) {
+pub async fn connect(http_req: &HttpRequest, stat: &mut HttpStat) -> Option<HttpConnection> {
     ensure_crypto_provider();
     let start = Instant::now();
-    let mut stat = HttpStat::default();
+    // let mut stat = HttpStat::default();
 
     let is_https = http_req.uri.scheme() == Some(&http::uri::Scheme::HTTPS);
 
-    let (tcp_stream, host, _is_http_forward, tcp_probe) =
-        match tcp_via_proxy(http_req, &mut stat).await {
-            Ok(r) => r,
-            Err(e) => return (finish_with_error(stat, e, start), None),
-        };
+    let (tcp_stream, host, _is_http_forward, tcp_probe) = match tcp_via_proxy(http_req, stat).await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            finish_with_error(stat, e, start);
+            return None;
+        }
+    };
 
     let handshake_timeout = http_req.request_timeout.unwrap_or(Duration::from_secs(30));
 
     if is_https {
-        let (tls_stream, is_h2) = match tls_handshake(host, tcp_stream, http_req, &mut stat).await {
+        let (tls_stream, is_h2) = match tls_handshake(host, tcp_stream, http_req, stat).await {
             Ok(r) => r,
-            Err(e) => return (finish_with_error(stat, e, start), None),
+            Err(e) => {
+                finish_with_error(stat, e, start);
+                return None;
+            }
         };
 
         if is_h2 {
@@ -877,16 +862,17 @@ pub async fn connect(http_req: &HttpRequest) -> (HttpStat, Option<HttpConnection
 
 impl HttpConnection {
     /// Send a request on the existing connection, returning only request-phase timing.
-    pub async fn send(&mut self, http_req: &HttpRequest) -> HttpStat {
+    pub async fn send(&mut self, http_req: &HttpRequest, stat: &mut HttpStat) {
         let start = Instant::now();
         // Seed the per-iteration TCP_INFO baseline from the previous send's
         // final sample (or the connection's post-connect snapshot for the
         // first iteration). This way each iteration's retransmits_during
         // counts only retransmits in *this* iteration's window.
-        let mut stat = HttpStat {
-            tcp_info_post_connect: self.last_tcp_info.clone(),
-            ..HttpStat::default()
-        };
+        stat.tcp_info_post_connect = self.last_tcp_info.clone();
+        // let mut stat = HttpStat {
+        //     tcp_info_post_connect: self.last_tcp_info.clone(),
+        //     ..HttpStat::default()
+        // };
 
         let is_http1 = !self.is_http2;
         let (req, done) = match build_tracked_request(http_req, is_http1) {
@@ -925,12 +911,12 @@ impl HttpConnection {
             Err(e) => return finish_with_error(stat, Error::Hyper { source: e }, start),
         };
         let response_at = Instant::now();
-        record_send_split(&mut stat, send_start, response_at, &done);
+        record_send_split(stat, send_start, response_at, &done);
         stat.status = Some(resp.status());
         stat.headers = Some(resp.headers().clone());
         stat.version = Some(format!("{:?}", resp.version()));
-        capture_server_timing(&mut stat, resp.headers());
-        capture_protocol_advertisements(&mut stat, resp.headers());
+        capture_server_timing(stat, resp.headers());
+        capture_protocol_advertisements(stat, resp.headers());
 
         // Read response body — frame-by-frame so we capture the
         // time-to-first-100K marker for throughput-split diagnosis (matches
@@ -979,7 +965,5 @@ impl HttpConnection {
                 }
             }
         }
-
-        stat
     }
 }
