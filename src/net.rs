@@ -17,7 +17,7 @@
 
 use super::error::{Error, Result};
 use super::http_request::ConnectTo;
-use super::skip_verifier::CapturingVerifier;
+// use super::skip_verifier::CapturingVerifier;
 use super::stats::{format_time, Certificate, HttpStat, ALPN_HTTP2, ALPN_HTTP3};
 use super::tcp_info::TcpInfoProbe;
 use super::HttpRequest;
@@ -27,8 +27,9 @@ use hickory_resolver::config::{
 };
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::TokioResolver;
-use rustls_pki_types::pem::PemObject;
-use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+// use rustls_pki_types::pem::PemObject;
+// use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+use rustls_platform_verifier::ConfigVerifierExt;
 use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -38,10 +39,9 @@ use tokio::net::TcpSocket;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_rustls::client::TlsStream;
-use tokio_rustls::rustls::client::{Resumption, WebPkiServerVerifier};
+use tokio_rustls::rustls::client::Resumption; // , WebPkiServerVerifier
 use tokio_rustls::rustls::{ClientConfig, HandshakeKind, RootCertStore};
 use tokio_rustls::TlsConnector;
-
 /// Transport used by a DoH/DoT preset, captured so we can run a parallel
 /// cold-connect probe and split `dns_lookup` into `dns_connect` + `dns_query`.
 #[cfg(feature = "doh")]
@@ -79,6 +79,7 @@ async fn probe_dns_endpoint(ep: &DnsProbeEndpoint, max: Duration) -> Option<Dura
         let mut config = ClientConfig::builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
+
         config.alpn_protocols = match ep.transport {
             DnsTransport::Doh => vec![b"h2".to_vec(), b"http/1.1".to_vec()],
             DnsTransport::Dot => vec![b"dot".to_vec()],
@@ -406,65 +407,70 @@ pub(crate) async fn tls_handshake(
     stat: &mut HttpStat,
 ) -> Result<(TlsStream<TcpStream>, bool)> {
     let tls_start = Instant::now();
-    let mut root_store = RootCertStore::empty();
-    let certs = rustls_native_certs::load_native_certs().certs;
 
-    // Add root certificates
-    for cert in certs {
-        root_store
-            .add(cert)
-            .map_err(|e| Error::Rustls { source: e })?;
-    }
+    // let mut root_store = RootCertStore::empty();
+    // let certs = rustls_native_certs::load_native_certs().certs;
+
+    // // Add root certificates
+    // for cert in certs {
+    //     root_store
+    //         .add(cert)
+    //         .map_err(|e| Error::Rustls { source: e })?;
+    // }
 
     // Build a webpki-backed verifier that we can wrap to observe OCSP stapling.
     // When `--skip-verify` is set we fall through to SkipVerifier and leave
     // `tls_ocsp_stapled` as None (OCSP detection is meaningless without
     // verification).
-    let builder = ClientConfig::builder().with_root_certificates(root_store.clone());
 
-    // Configure TLS client (with or without client auth)
-    let mut config = if let (Some(cert_pem), Some(key_pem)) = (
-        http_req.client_cert.as_deref(),
-        http_req.client_key.as_deref(),
-    ) {
-        let cert_chain: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(cert_pem)
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| Error::Common {
-                category: "cert".to_string(),
-                message: e.to_string(),
-            })?;
-        let key = PrivateKeyDer::from_pem_slice(key_pem).map_err(|e| Error::Common {
-            category: "key".to_string(),
-            message: e.to_string(),
-        })?;
-        builder
-            .with_client_auth_cert(cert_chain, key)
-            .map_err(|e| Error::Rustls { source: e })?
-    } else {
-        builder.with_no_client_auth()
-    };
+    // let builder = ClientConfig::builder().with_root_certificates(root_store.clone());
 
+    // // Configure TLS client (with or without client auth)
+    // let mut config = if let (Some(cert_pem), Some(key_pem)) = (
+    //     http_req.client_cert.as_deref(),
+    //     http_req.client_key.as_deref(),
+    // ) {
+    //     let cert_chain: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(cert_pem)
+    //         .collect::<std::result::Result<Vec<_>, _>>()
+    //         .map_err(|e| Error::Common {
+    //             category: "cert".to_string(),
+    //             message: e.to_string(),
+    //         })?;
+    //     let key = PrivateKeyDer::from_pem_slice(key_pem).map_err(|e| Error::Common {
+    //         category: "key".to_string(),
+    //         message: e.to_string(),
+    //     })?;
+    //     builder
+    //         .with_client_auth_cert(cert_chain, key)
+    //         .map_err(|e| Error::Rustls { source: e })?
+    // } else {
+    //     builder.with_no_client_auth()
+    // };
+
+    let mut config =
+        ClientConfig::with_platform_verifier().map_err(|e| Error::Rustls { source: e })?;
     // Install verifier: SkipVerifier when --skip-verify, otherwise wrap the
     // default WebPkiServerVerifier so we can record whether the server stapled
     // an OCSP response.
-    let ocsp_handle: Option<Arc<std::sync::OnceLock<bool>>> = if http_req.skip_verify {
-        config
-            .dangerous()
-            .set_certificate_verifier(Arc::new(SkipVerifier));
-        None
-    } else {
-        let inner = WebPkiServerVerifier::builder(Arc::new(root_store))
-            .build()
-            .map_err(|e| Error::Common {
-                category: "tls".to_string(),
-                message: e.to_string(),
-            })?;
-        let (capturing, handle) = CapturingVerifier::new(inner);
-        config
-            .dangerous()
-            .set_certificate_verifier(Arc::new(capturing));
-        Some(handle)
-    };
+    let ocsp_handle: Option<Arc<std::sync::OnceLock<bool>>> = None;
+    // if http_req.skip_verify {
+    //     config
+    //         .dangerous()
+    //         .set_certificate_verifier(Arc::new(SkipVerifier));
+    //     None
+    // } else {
+    //     let inner = WebPkiServerVerifier::builder(Arc::new(root_store))
+    //         .build()
+    //         .map_err(|e| Error::Common {
+    //             category: "tls".to_string(),
+    //             message: e.to_string(),
+    //         })?;
+    //     let (capturing, handle) = CapturingVerifier::new(inner);
+    //     config
+    //         .dangerous()
+    //         .set_certificate_verifier(Arc::new(capturing));
+    //     Some(handle)
+    // };
 
     // Enable 0-RTT and wire the session store (if the caller provided one,
     // e.g. the -n benchmark loop), so a resumed handshake can occur and we
@@ -554,42 +560,45 @@ pub(crate) async fn quic_connect(
     host: String,
     addr: SocketAddr,
     skip_verify: bool,
-    client_cert: Option<&[u8]>,
-    client_key: Option<&[u8]>,
+    _client_cert: Option<&[u8]>,
+    _client_key: Option<&[u8]>,
     bind_addr: Option<IpAddr>,
     stat: &mut HttpStat,
 ) -> Result<(quinn::Endpoint, quinn::Connection)> {
     let quic_start = Instant::now();
-    let mut root_store = RootCertStore::empty();
-    let certs = rustls_native_certs::load_native_certs().certs;
+    // let mut root_store = RootCertStore::empty();
+    // let certs = rustls_native_certs::load_native_certs().certs;
 
-    // Add root certificates
-    for cert in certs {
-        root_store
-            .add(cert)
-            .map_err(|e| Error::Rustls { source: e })?;
-    }
+    // // Add root certificates
+    // for cert in certs {
+    //     root_store
+    //         .add(cert)
+    //         .map_err(|e| Error::Rustls { source: e })?;
+    // }
 
-    let builder = ClientConfig::builder().with_root_certificates(root_store);
+    // let builder = ClientConfig::builder().with_root_certificates(root_store);
 
     // Configure QUIC client (with or without client auth)
-    let mut config = if let (Some(cert_pem), Some(key_pem)) = (client_cert, client_key) {
-        let cert_chain: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(cert_pem)
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| Error::Common {
-                category: "cert".to_string(),
-                message: e.to_string(),
-            })?;
-        let key = PrivateKeyDer::from_pem_slice(key_pem).map_err(|e| Error::Common {
-            category: "key".to_string(),
-            message: e.to_string(),
-        })?;
-        builder
-            .with_client_auth_cert(cert_chain, key)
-            .map_err(|e| Error::Rustls { source: e })?
-    } else {
-        builder.with_no_client_auth()
-    };
+    // let mut config = if let (Some(cert_pem), Some(key_pem)) = (client_cert, client_key) {
+    //     let cert_chain: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(cert_pem)
+    //         .collect::<std::result::Result<Vec<_>, _>>()
+    //         .map_err(|e| Error::Common {
+    //             category: "cert".to_string(),
+    //             message: e.to_string(),
+    //         })?;
+    //     let key = PrivateKeyDer::from_pem_slice(key_pem).map_err(|e| Error::Common {
+    //         category: "key".to_string(),
+    //         message: e.to_string(),
+    //     })?;
+    //     builder
+    //         .with_client_auth_cert(cert_chain, key)
+    //         .map_err(|e| Error::Rustls { source: e })?
+    // } else {
+    //     builder.with_no_client_auth()
+    // };
+
+    let mut config =
+        ClientConfig::with_platform_verifier().map_err(|e| Error::Rustls { source: e })?;
     config.enable_early_data = true;
     config.alpn_protocols = vec![ALPN_HTTP3.as_bytes().to_vec()];
 

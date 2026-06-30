@@ -26,6 +26,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![allow(unused)]
+
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use std::sync::{Arc, OnceLock};
