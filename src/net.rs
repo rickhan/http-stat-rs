@@ -453,6 +453,11 @@ pub(crate) async fn tls_handshake(
     // default WebPkiServerVerifier so we can record whether the server stapled
     // an OCSP response.
     let ocsp_handle: Option<Arc<std::sync::OnceLock<bool>>> = None;
+    if http_req.skip_verify {
+        config
+            .dangerous()
+            .set_certificate_verifier(Arc::new(SkipVerifier));
+    }
     // if http_req.skip_verify {
     //     config
     //         .dangerous()
