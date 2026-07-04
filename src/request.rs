@@ -250,11 +250,9 @@ async fn send_https2_request(
         async {
             let mut builder = hyper::client::conn::http2::Builder::new(TokioExecutor::new());
 
-            // 全部关闭优化
             builder.initial_stream_window_size(None);
             builder.initial_connection_window_size(None);
-            // 如果有 adaptive_window 方法，也关闭
-            // builder.adaptive_window(false);
+            builder.adaptive_window(false);
 
             let (sender, conn) = builder.handshake(TokioIo::new(tls_stream)).await?;
             Ok((sender, conn))
@@ -275,7 +273,8 @@ async fn send_https2_request(
     *req.version_mut() = hyper::Version::HTTP_2;
     // Remove Host header for HTTP/2 as it's replaced by :authority
     req.headers_mut().remove("Host");
-
+    println!("{:#?}", req.headers());
+    println!("{}", req.uri());
     let send_start = Instant::now();
     let resp = sender
         .send_request(req)
