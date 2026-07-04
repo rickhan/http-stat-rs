@@ -81,17 +81,38 @@ impl Body for TrackedBody {
     ) -> Poll<Option<std::result::Result<Frame<Self::Data>, Self::Error>>> {
         let this = self.get_mut();
         if let Some(bytes) = this.data.take() {
-            Poll::Ready(Some(Ok(Frame::data(bytes))))
+            // Poll::Ready(Some(Ok(Frame::data(bytes))))
+            // 如果 bytes 长度大于 0，说明是真正的 POST/PUT 有效载荷
+            if !bytes.is_empty() {
+                return Poll::Ready(Some(Ok(Frame::data(bytes))));
+            }
         } else {
-            let _ = this.done.set(Instant::now());
-            Poll::Ready(None)
+            // let _ = this.done.set(Instant::now());
+            // Poll::Ready(None)
         }
+        // 走到这里说明没有数据或数据为空，标记完成
+        let _ = this.done.set(Instant::now());
+        Poll::Ready(None)
     }
 
     fn is_end_stream(&self) -> bool {
-        // Always force hyper to poll us so we can record completion.
-        false
+        match &self.data {
+            // 如果 data 是 None，或者 data 的 Bytes 长度为 0（如 GET 请求）
+            None => {
+                let _ = self.done.set(Instant::now());
+                true
+            }
+            Some(b) if b.is_empty() => {
+                let _ = self.done.set(Instant::now());
+                true // 允许 hyper 在 HEADERS 帧上直接打上 END_STREAM 标记，完美解决 S3 的报错
+            }
+            _ => false, // 只有真正有请求体（长度 > 0）时，才返回 false
+        }
     }
+    // fn is_end_stream(&self) -> bool {
+    //     // Always force hyper to poll us so we can record completion.
+    //     false
+    // }
 
     fn size_hint(&self) -> SizeHint {
         match &self.data {
@@ -247,16 +268,7 @@ async fn send_https2_request(
 ) -> Result<Response<Incoming>> {
     let (mut sender, conn) = timeout(
         request_timeout.unwrap_or(Duration::from_secs(30)),
-        async {
-            let mut builder = hyper::client::conn::http2::Builder::new(TokioExecutor::new());
-
-            builder.initial_stream_window_size(None);
-            builder.initial_connection_window_size(None);
-            builder.adaptive_window(false);
-
-            let (sender, conn) = builder.handshake(TokioIo::new(tls_stream)).await?;
-            Ok((sender, conn))
-        }, // hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls_stream)),
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls_stream)),
     )
     .await
     .map_err(|e| Error::Timeout { source: e })?
@@ -273,8 +285,6 @@ async fn send_https2_request(
     *req.version_mut() = hyper::Version::HTTP_2;
     // Remove Host header for HTTP/2 as it's replaced by :authority
     req.headers_mut().remove("Host");
-    println!("{:#?}", req.headers());
-    println!("{}", req.uri());
     let send_start = Instant::now();
     let resp = sender
         .send_request(req)
