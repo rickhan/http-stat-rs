@@ -247,7 +247,18 @@ async fn send_https2_request(
 ) -> Result<Response<Incoming>> {
     let (mut sender, conn) = timeout(
         request_timeout.unwrap_or(Duration::from_secs(30)),
-        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls_stream)),
+        async {
+            let mut builder = hyper::client::conn::http2::Builder::new(TokioExecutor::new());
+
+            // 全部关闭优化
+            builder.initial_stream_window_size(None);
+            builder.initial_connection_window_size(None);
+            // 如果有 adaptive_window 方法，也关闭
+            // builder.adaptive_window(false);
+
+            let (sender, conn) = builder.handshake(TokioIo::new(tls_stream)).await?;
+            Ok((sender, conn))
+        }, // hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls_stream)),
     )
     .await
     .map_err(|e| Error::Timeout { source: e })?
