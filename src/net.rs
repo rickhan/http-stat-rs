@@ -323,7 +323,7 @@ pub(crate) async fn dns_resolve(
     // accurate — failures leave `dns_connect` as None and never block the
     // real resolver result.
     let resolver = builder.build().map_err(|e| Error::Resolve { source: e })?;
-    let dns_timeout = req.dns_timeout.unwrap_or(Duration::from_secs(5));
+    let dns_timeout = req.dns_timeout.unwrap_or(Duration::from_secs(10));
     let dns_start = Instant::now();
     let lookup_fut = timeout(dns_timeout, resolver.lookup_ip(&lookup_host));
 
@@ -389,7 +389,7 @@ pub(crate) async fn tcp_connect(
                 .map_err(|e| Error::Io { source: e })
         }
     };
-    let tcp_stream = timeout(tcp_timeout.unwrap_or(Duration::from_secs(5)), connect_fut)
+    let tcp_stream = timeout(tcp_timeout.unwrap_or(Duration::from_secs(10)), connect_fut)
         .await
         .map_err(|e| Error::Timeout { source: e })??;
     stat.tcp_connect = Some(tcp_start.elapsed());
@@ -496,7 +496,7 @@ pub(crate) async fn tls_handshake(
 
     // Perform TLS handshake
     let tls_stream = timeout(
-        http_req.tls_timeout.unwrap_or(Duration::from_secs(5)),
+        http_req.tls_timeout.unwrap_or(Duration::from_secs(10)),
         connector.connect(
             host.clone()
                 .try_into()
