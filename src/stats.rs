@@ -152,6 +152,13 @@ pub struct HttpStat {
     /// uncompressed response this matches `body_size`; for `gzip`/`br`/`zstd`
     /// it's smaller and is the right denominator for *network* throughput.
     pub wire_body_size: Option<usize>,
+    /// Whether the protocol reported a complete response body/end-of-stream.
+    pub body_complete: bool,
+    /// Whether body reading stopped intentionally after reaching a sample cap
+    /// (or immediately in headers-only mode).
+    pub body_sampled: bool,
+    /// Whether the independent response-body budget elapsed.
+    pub body_timeout: bool,
     /// Time from the start of `content_transfer` until the first 100 KiB of
     /// body bytes had arrived. Combined with the overall content_transfer
     /// duration, it splits download throughput into "first 100 KB" vs
@@ -951,6 +958,9 @@ impl HttpStat {
             "body_size".into(),
             self.body_size.map_or(Value::Null, |s| json!(s)),
         );
+        obj.insert("body_complete".into(), json!(self.body_complete));
+        obj.insert("body_sampled".into(), json!(self.body_sampled));
+        obj.insert("body_timeout".into(), json!(self.body_timeout));
 
         // Error
         obj.insert(

@@ -110,6 +110,18 @@ impl ConnectTo {
     }
 }
 
+/// Controls how much of the response body is consumed.
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseBodyMode {
+    /// Read the response body until the protocol reports end-of-stream.
+    #[default]
+    Full,
+    /// Read at most `response_body_limit` wire bytes, then stop successfully.
+    Sample,
+    /// Return after the response headers without consuming the body.
+    HeadersOnly,
+}
+
 // HttpRequest struct to hold request configuration
 #[derive(Default, Debug, Clone)]
 pub struct HttpRequest {
@@ -126,13 +138,22 @@ pub struct HttpRequest {
     pub tcp_timeout: Option<Duration>,           // TCP connection timeout
     pub tls_timeout: Option<Duration>,           // TLS handshake timeout
     pub request_timeout: Option<Duration>,       // HTTP request timeout
-    pub quic_timeout: Option<Duration>,          // QUIC connection timeout
-    pub client_cert: Option<Vec<u8>>,            // PEM-encoded client certificate (mTLS)
-    pub client_key: Option<Vec<u8>>,             // PEM-encoded client private key (mTLS)
-    pub proxy: Option<String>,                   // Proxy URL (http://, https://, socks5://)
-    pub use_absolute_uri: bool,                  // Send absolute URI (HTTP forward proxy)
-    pub connect_to: Vec<String>,                 // --connect-to HOST1:PORT1:HOST2:PORT2 overrides
-    pub bind_addr: Option<IpAddr>,               // Local source IP to bind before connecting
+    /// Maximum time spent waiting for the response headers after the request
+    /// has been handed to the HTTP connection.
+    pub response_header_timeout: Option<Duration>,
+    /// Response body handling policy. Defaults to `Full` for compatibility.
+    pub response_body_mode: ResponseBodyMode,
+    /// Maximum wire bytes retained in `Sample` mode.
+    pub response_body_limit: Option<usize>,
+    /// Wall-clock budget for consuming the response body.
+    pub response_body_timeout: Option<Duration>,
+    pub quic_timeout: Option<Duration>, // QUIC connection timeout
+    pub client_cert: Option<Vec<u8>>,   // PEM-encoded client certificate (mTLS)
+    pub client_key: Option<Vec<u8>>,    // PEM-encoded client private key (mTLS)
+    pub proxy: Option<String>,          // Proxy URL (http://, https://, socks5://)
+    pub use_absolute_uri: bool,         // Send absolute URI (HTTP forward proxy)
+    pub connect_to: Vec<String>,        // --connect-to HOST1:PORT1:HOST2:PORT2 overrides
+    pub bind_addr: Option<IpAddr>,      // Local source IP to bind before connecting
     /// Optional shared TLS session store. When set, the rustls `ClientConfig`
     /// is wired with `Resumption::store(...)` and `enable_early_data = true`,
     /// so subsequent requests sharing this store can perform a resumed

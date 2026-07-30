@@ -40,7 +40,9 @@ use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::rustls::client::Resumption; // , WebPkiServerVerifier
-use tokio_rustls::rustls::{ClientConfig, HandshakeKind, RootCertStore};
+use tokio_rustls::rustls::{ClientConfig, HandshakeKind};
+#[cfg(feature = "doh")]
+use tokio_rustls::rustls::RootCertStore;
 use tokio_rustls::TlsConnector;
 /// Transport used by a DoH/DoT preset, captured so we can run a parallel
 /// cold-connect probe and split `dns_lookup` into `dns_connect` + `dns_query`.

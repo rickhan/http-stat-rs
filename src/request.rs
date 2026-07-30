@@ -24,7 +24,7 @@ use super::proxy::{http_connect, socks5_connect, ProxyConfig, ProxyKind};
 use super::stats::{
     parse_alt_svc, parse_hsts, parse_server_timing, HttpStat, ALPN_HTTP3, FIRST_CHUNK_BYTES,
 };
-use super::HttpRequest;
+use super::{HttpRequest, ResponseBodyMode};
 use bytes::{Buf, Bytes, BytesMut};
 use futures::future;
 
@@ -192,23 +192,96 @@ fn capture_protocol_advertisements(stat: &mut HttpStat, headers: &http::HeaderMa
 /// accumulator first crosses [`FIRST_CHUNK_BYTES`]. The returned tuple is
 /// `(body_bytes, time_to_first_100k)`. `time_to_first_100k` is `None` when
 /// the body is smaller than the threshold — there's no split to report.
+struct BodyReadResult {
+    bytes: Bytes,
+    time_to_first_100k: Option<Duration>,
+    complete: bool,
+    sampled: bool,
+    timed_out: bool,
+}
+
 async fn drain_body_with_split(
     body: Incoming,
     start: Instant,
-) -> std::result::Result<(Bytes, Option<Duration>), String> {
+    mode: ResponseBodyMode,
+    limit: Option<usize>,
+    body_timeout: Option<Duration>,
+) -> std::result::Result<BodyReadResult, String> {
+    if mode == ResponseBodyMode::HeadersOnly {
+        return Ok(BodyReadResult {
+            bytes: Bytes::new(),
+            time_to_first_100k: None,
+            complete: false,
+            sampled: true,
+            timed_out: false,
+        });
+    }
+
     let mut body = body;
     let mut buf = BytesMut::new();
     let mut first_chunk_at: Option<Duration> = None;
-    while let Some(frame_res) = body.frame().await {
+    let sample_limit =
+        (mode == ResponseBodyMode::Sample).then_some(limit.unwrap_or(64 * 1024).max(1));
+    let deadline = body_timeout.map(|duration| start + duration);
+
+    loop {
+        if sample_limit.is_some_and(|limit| buf.len() >= limit) {
+            return Ok(BodyReadResult {
+                bytes: buf.freeze(),
+                time_to_first_100k: first_chunk_at,
+                complete: false,
+                sampled: true,
+                timed_out: false,
+            });
+        }
+
+        let frame_res = if let Some(deadline) = deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(BodyReadResult {
+                    bytes: buf.freeze(),
+                    time_to_first_100k: first_chunk_at,
+                    complete: false,
+                    sampled: false,
+                    timed_out: true,
+                });
+            }
+            match timeout(remaining, body.frame()).await {
+                Ok(frame) => frame,
+                Err(_) => {
+                    return Ok(BodyReadResult {
+                        bytes: buf.freeze(),
+                        time_to_first_100k: first_chunk_at,
+                        complete: false,
+                        sampled: false,
+                        timed_out: true,
+                    });
+                }
+            }
+        } else {
+            body.frame().await
+        };
+
+        let Some(frame_res) = frame_res else {
+            return Ok(BodyReadResult {
+                bytes: buf.freeze(),
+                time_to_first_100k: first_chunk_at,
+                complete: true,
+                sampled: false,
+                timed_out: false,
+            });
+        };
         let frame = frame_res.map_err(|e| format!("Failed to read response body: {e}"))?;
         if let Ok(data) = frame.into_data() {
-            buf.extend_from_slice(&data);
+            let take = sample_limit
+                .map(|limit| limit.saturating_sub(buf.len()).min(data.len()))
+                .unwrap_or(data.len());
+            buf.extend_from_slice(&data[..take]);
             if first_chunk_at.is_none() && buf.len() >= FIRST_CHUNK_BYTES {
                 first_chunk_at = Some(start.elapsed());
             }
         }
     }
-    Ok((buf.freeze(), first_chunk_at))
 }
 
 // Initialize crypto provider once
@@ -226,6 +299,7 @@ async fn send_http1_request<S>(
     done: Arc<OnceLock<Instant>>,
     stream: S,
     request_timeout: Option<Duration>,
+    response_header_timeout: Option<Duration>,
     tx: oneshot::Sender<String>,
     stat: &mut HttpStat,
 ) -> Result<Response<Incoming>>
@@ -248,10 +322,13 @@ where
     });
 
     let send_start = Instant::now();
-    let resp = sender
-        .send_request(req)
-        .await
-        .map_err(|e| Error::Hyper { source: e })?;
+    let resp = timeout(
+        response_header_timeout.unwrap_or(Duration::from_secs(30)),
+        sender.send_request(req),
+    )
+    .await
+    .map_err(|e| Error::Timeout { source: e })?
+    .map_err(|e| Error::Hyper { source: e })?;
     let response_at = Instant::now();
     record_send_split(stat, send_start, response_at, &done);
     Ok(resp)
@@ -263,6 +340,7 @@ async fn send_https2_request(
     done: Arc<OnceLock<Instant>>,
     tls_stream: TlsStream<TcpStream>,
     request_timeout: Option<Duration>,
+    response_header_timeout: Option<Duration>,
     tx: oneshot::Sender<String>,
     stat: &mut HttpStat,
 ) -> Result<Response<Incoming>> {
@@ -286,10 +364,13 @@ async fn send_https2_request(
     // Remove Host header for HTTP/2 as it's replaced by :authority
     req.headers_mut().remove("Host");
     let send_start = Instant::now();
-    let resp = sender
-        .send_request(req)
-        .await
-        .map_err(|e| Error::Hyper { source: e })?;
+    let resp = timeout(
+        response_header_timeout.unwrap_or(Duration::from_secs(30)),
+        sender.send_request(req),
+    )
+    .await
+    .map_err(|e| Error::Timeout { source: e })?
+    .map_err(|e| Error::Hyper { source: e })?;
     let response_at = Instant::now();
     record_send_split(stat, send_start, response_at, &done);
     Ok(resp)
@@ -580,8 +661,16 @@ async fn http1_2_request(mut http_req: HttpRequest, stat: &mut HttpStat) {
                 }
             };
             stat.request_headers = req.headers().clone();
-            match send_https2_request(req, done, tls_stream, http_req.request_timeout, tx, stat)
-                .await
+            match send_https2_request(
+                req,
+                done,
+                tls_stream,
+                http_req.request_timeout,
+                http_req.response_header_timeout,
+                tx,
+                stat,
+            )
+            .await
             {
                 Ok(resp) => resp,
                 Err(e) => {
@@ -597,8 +686,16 @@ async fn http1_2_request(mut http_req: HttpRequest, stat: &mut HttpStat) {
                 }
             };
             stat.request_headers = req.headers().clone();
-            match send_http1_request(req, done, tls_stream, http_req.request_timeout, tx, stat)
-                .await
+            match send_http1_request(
+                req,
+                done,
+                tls_stream,
+                http_req.request_timeout,
+                http_req.response_header_timeout,
+                tx,
+                stat,
+            )
+            .await
             {
                 Ok(resp) => resp,
                 Err(e) => {
@@ -616,7 +713,17 @@ async fn http1_2_request(mut http_req: HttpRequest, stat: &mut HttpStat) {
         };
         stat.request_headers = req.headers().clone();
         // Send HTTP request
-        match send_http1_request(req, done, tcp_stream, http_req.request_timeout, tx, stat).await {
+        match send_http1_request(
+            req,
+            done,
+            tcp_stream,
+            http_req.request_timeout,
+            http_req.response_header_timeout,
+            tx,
+            stat,
+        )
+        .await
+        {
             Ok(resp) => resp,
             Err(e) => {
                 finish_with_error(stat, e, start);
@@ -641,17 +748,27 @@ async fn http1_2_request(mut http_req: HttpRequest, stat: &mut HttpStat) {
     // us split throughput into "first 100 KB" (TCP slow-start dominated)
     // and "tail" (steady-state server send rate).
     let content_transfer_start = Instant::now();
-    let drain_result = drain_body_with_split(resp.into_body(), content_transfer_start).await;
-    let (body_bytes, time_to_first_100k) = match drain_result {
+    let drain_result = drain_body_with_split(
+        resp.into_body(),
+        content_transfer_start,
+        http_req.response_body_mode,
+        http_req.response_body_limit,
+        http_req.response_body_timeout,
+    )
+    .await;
+    let body_result = match drain_result {
         Ok(p) => p,
         Err(e) => {
             finish_with_error(stat, e, start);
             return;
         }
     };
-    stat.wire_body_size = Some(body_bytes.len());
-    stat.time_to_first_100k = time_to_first_100k;
-    stat.body = Some(body_bytes);
+    stat.wire_body_size = Some(body_result.bytes.len());
+    stat.time_to_first_100k = body_result.time_to_first_100k;
+    stat.body_complete = body_result.complete;
+    stat.body_sampled = body_result.sampled;
+    stat.body_timeout = body_result.timed_out;
+    stat.body = Some(body_result.bytes);
     stat.content_transfer = Some(content_transfer_start.elapsed());
 
     // Second kernel TCP sample: retransmits accumulated during the body read,
@@ -722,7 +839,9 @@ pub async fn request(http_req: HttpRequest, stat: &mut HttpStat) {
         ""
     };
 
-    if !encoding.is_empty() {
+    // A sampled/timeout body may end in the middle of a compressed stream.
+    // Only attempt decompression after the protocol confirmed end-of-stream.
+    if !encoding.is_empty() && stat.body_complete {
         if let Some(body) = &stat.body {
             match decompress(encoding, body) {
                 Ok(data) => {
@@ -942,11 +1061,22 @@ impl HttpConnection {
         // time-to-first-100K marker for throughput-split diagnosis (matches
         // the http1_2_request path).
         let content_transfer_start = Instant::now();
-        match drain_body_with_split(resp.into_body(), content_transfer_start).await {
-            Ok((body_bytes, first_100k)) => {
-                stat.wire_body_size = Some(body_bytes.len());
-                stat.time_to_first_100k = first_100k;
-                stat.body = Some(body_bytes);
+        match drain_body_with_split(
+            resp.into_body(),
+            content_transfer_start,
+            http_req.response_body_mode,
+            http_req.response_body_limit,
+            http_req.response_body_timeout,
+        )
+        .await
+        {
+            Ok(body_result) => {
+                stat.wire_body_size = Some(body_result.bytes.len());
+                stat.time_to_first_100k = body_result.time_to_first_100k;
+                stat.body_complete = body_result.complete;
+                stat.body_sampled = body_result.sampled;
+                stat.body_timeout = body_result.timed_out;
+                stat.body = Some(body_result.bytes);
                 stat.content_transfer = Some(content_transfer_start.elapsed());
             }
             Err(e) => {
@@ -977,7 +1107,7 @@ impl HttpConnection {
             .and_then(|h| h.get("content-encoding"))
             .and_then(|v| v.to_str().ok())
             .unwrap_or_default();
-        if !encoding.is_empty() {
+        if !encoding.is_empty() && stat.body_complete {
             if let Some(body) = &stat.body {
                 match decompress(encoding, body) {
                     Ok(data) => stat.body = Some(data),
@@ -985,5 +1115,99 @@ impl HttpConnection {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod body_policy_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    fn serve_once(response: Vec<u8>, hold_open: Duration) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request);
+            stream.write_all(&response).unwrap();
+            stream.flush().unwrap();
+            thread::sleep(hold_open);
+        });
+        port
+    }
+
+    fn run_request(port: u16, configure: impl FnOnce(&mut HttpRequest)) -> HttpStat {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let url = format!("http://127.0.0.1:{port}/");
+            let mut req = HttpRequest::try_from(url.as_str()).unwrap();
+            req.alpn_protocols = vec![super::super::stats::ALPN_HTTP1.to_string()];
+            configure(&mut req);
+            let mut stat = HttpStat::default();
+            request(req, &mut stat).await;
+            stat
+        })
+    }
+
+    #[test]
+    fn sample_mode_stops_at_wire_byte_limit_without_waiting_for_eof() {
+        let body = vec![b'x'; 128 * 1024];
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(&body);
+        let port = serve_once(response, Duration::from_secs(1));
+
+        let stat = run_request(port, |req| {
+            req.response_body_mode = ResponseBodyMode::Sample;
+            req.response_body_limit = Some(64 * 1024);
+            req.response_body_timeout = Some(Duration::from_secs(2));
+        });
+
+        assert_eq!(stat.status.map(|s| s.as_u16()), Some(200));
+        assert_eq!(stat.wire_body_size, Some(64 * 1024));
+        assert!(stat.body_sampled);
+        assert!(!stat.body_complete);
+        assert!(!stat.body_timeout);
+    }
+
+    #[test]
+    fn body_timeout_returns_partial_response_without_using_total_timeout() {
+        let response =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: keep-alive\r\n\r\nx".to_vec();
+        let port = serve_once(response, Duration::from_secs(1));
+
+        let stat = run_request(port, |req| {
+            req.response_body_mode = ResponseBodyMode::Sample;
+            req.response_body_limit = Some(64 * 1024);
+            req.response_body_timeout = Some(Duration::from_millis(50));
+        });
+
+        assert_eq!(stat.status.map(|s| s.as_u16()), Some(200));
+        assert_eq!(stat.wire_body_size, Some(1));
+        assert!(stat.body_timeout);
+        assert!(stat.total.unwrap() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn response_header_timeout_is_independent_from_body_timeout() {
+        let port = serve_once(Vec::new(), Duration::from_millis(200));
+
+        let stat = run_request(port, |req| {
+            req.response_header_timeout = Some(Duration::from_millis(50));
+            req.response_body_timeout = Some(Duration::from_secs(1));
+        });
+
+        assert!(stat.status.is_none());
+        assert!(stat.error.as_deref().is_some_and(|e| e.contains("timeout")));
+        assert!(stat.total.unwrap() < Duration::from_millis(500));
     }
 }
